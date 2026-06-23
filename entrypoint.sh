@@ -1,9 +1,14 @@
 #!/bin/bash
-# Camoufox manages its own Xvfb when headless='virtual', so this
-# entrypoint just hands off to python. Any stale X locks inside the
-# container filesystem are cleared so Camoufox can pick a fresh display.
+# Default to headed Chromium under Xvfb. Real Cloudflare deployments
+# fingerprint --headless=new ("HeadlessChrome" UA + missing GPU/audio
+# signals) and refuse to mount the Turnstile iframe. Running under a
+# virtual X server keeps the UA clean and lets the widget render.
 set -e
 
-rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true
+if [ -z "$DISPLAY" ]; then
+    Xvfb :99 -screen 0 1280x900x24 -nolisten tcp >/dev/null 2>&1 &
+    export DISPLAY=:99
+    sleep 0.5
+fi
 
 exec python3 service.py

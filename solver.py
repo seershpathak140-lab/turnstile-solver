@@ -2,23 +2,23 @@
 Cloudflare Turnstile + JS-Challenge ("Just a moment...") solver.
 
 Design notes:
-  - Single warm Camoufox (stealth Firefox) browser with a persistent
-    profile. Camoufox replaces nodriver because CF fingerprints
-    patchright/nodriver on current Cloudflare deploys so the Turnstile
-    iframe never mounts. Camoufox + its built-in human-like mouse model
-    reliably clears the widget.
-  - New page per request via `browser.new_page()`, closed after solve.
-  - Solves serialised through a lock: concurrent tabs hitting the same
-    sitekey make CF escalate difficulty. HTTP callers can still fire in
-    parallel - requests queue here.
-  - No hardcoded sleeps. Event-driven waits via page.wait_for_function.
-  - Two public entry points:
-        solve_async(sitekey, siteurl) -> str
-        solve_challenge_async(siteurl) -> dict   # cleared cookies + html
-
-  - solve_challenge_async optionally delegates to a challenge proxy
-    (Byparr or FlareSolverr) when CHALLENGE_PROXY_URL / FLARESOLVERR_URL
-    is set. The in-process browser is the fallback.
+  - Backend: Camoufox (stealth Firefox build with realistic OS
+    fingerprints) running headed under a virtual X server (Xvfb).
+    Real Cloudflare deployments fingerprint --headless=new builds
+    (HeadlessChrome UA + missing GPU/audio signals) and refuse to
+    mount the Turnstile iframe; running headed under Xvfb keeps the
+    UA clean and lets the widget render.
+  - HTML template + click strategy borrowed from Boterdrop-Solver:
+    minimal host page that loads the CF api.js, plus a CSS shrink
+    hack on the .cf-turnstile div so click coordinates land on the
+    invisible-mode hit area predictably. Persistent click loop until
+    cf-turnstile-response is filled.
+  - Single warm browser, persistent profile. Solves serialised inside
+    the service via solve_lock (CF escalates difficulty when the same
+    sitekey is hit by multiple tabs of the same profile concurrently).
+  - solve_challenge_async optionally delegates to a Byparr /
+    FlareSolverr proxy via CHALLENGE_PROXY_URL; the in-process browser
+    is the fallback.
 """
 
 import asyncio
@@ -31,6 +31,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
+from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
 
 
@@ -51,14 +52,15 @@ def _get_profile_dir() -> str:
 
 
 def _headless_mode():
-    # Camoufox accepts False, True, or 'virtual'. 'virtual' spawns its own
-    # Xvfb internally so we don't need one in the image.
-    mode = os.environ.get("CAMOUFOX_HEADLESS", "virtual").lower()
-    if mode in ("true", "1"):
+    """Default to headed under the entrypoint-managed Xvfb. Headless
+    Camoufox/Firefox can still be requested via HEADLESS=true but real
+    CF widgets refuse to mount on it."""
+    mode = os.environ.get("HEADLESS", "false").lower()
+    if mode in ("true", "1", "yes"):
         return True
-    if mode in ("false", "0"):
-        return False
-    return "virtual"
+    if mode in ("virtual",):
+        return "virtual"
+    return False
 
 
 # ---------- Singleton browser ----------
@@ -89,9 +91,6 @@ class BrowserSingleton:
         async with self._start_lock:
             if self._is_alive():
                 return
-            # Stale handle from a crashed driver — tear it down before
-            # relaunching, otherwise the next new_page() reuses a dead
-            # connection and fails with "Connection closed".
             if self.browser is not None or self._camoufox is not None:
                 log.warning("browser handle stale, relaunching camoufox")
                 try:
@@ -103,7 +102,10 @@ class BrowserSingleton:
                 self.browser = None
             profile = _get_profile_dir()
             os.makedirs(profile, exist_ok=True)
-            log.info("launching camoufox profile=%s", profile)
+            log.info("launching camoufox profile=%s headless=%s",
+                     profile, _headless_mode())
+            # exclude_addons=[DefaultAddons.UBO] — uBlock Origin sometimes
+            # blocks the CF api.js script, which kills widget mount.
             self._camoufox = AsyncCamoufox(
                 headless=_headless_mode(),
                 humanize=True,
@@ -111,21 +113,21 @@ class BrowserSingleton:
                 user_data_dir=profile,
                 os=["windows", "macos", "linux"],
                 locale="en-US",
+                exclude_addons=[DefaultAddons.UBO],
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
-            # AsyncCamoufox is an async context manager. Enter it
-            # manually so the BrowserContext survives beyond a `with`
-            # block and can be reused across many HTTP requests.
             self.browser = await self._camoufox.__aenter__()
             self.stopped = False
             log.info("camoufox ready")
 
-    async def new_page(self, url: str):
+    async def new_page(self, url: str = ""):
         await self.ensure()
         page = await self.browser.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        except Exception as e:
-            log.warning("initial goto failed: %s", e)
+        if url:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception as e:
+                log.warning("initial goto failed: %s", e)
         return page
 
     async def shutdown(self):
@@ -158,53 +160,23 @@ async def get_pool(size: Optional[int] = None) -> BrowserSingleton:
 
 
 # ---------- Turnstile injection ----------
+# Minimal host page modelled after Boterdrop. The api.js loads with an
+# explicit onload callback and an <p> element keeps the body non-empty
+# so layout settles before the widget renders.
+_HOST_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>.</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
+</head>
+<body>
+__WIDGET__
+<p id="ip-display"></p>
+</body>
+</html>"""
 
-_INJECT_JS_TEMPLATE = """
-(() => {
-    if (document.getElementById('_ts_box')) return;
-    window._tsToken = null;
-    const wrap = document.createElement('div');
-    wrap.id = '_ts_box';
-    wrap.style = 'position:fixed;top:20px;left:20px;z-index:2147483647;';
-    document.body.appendChild(wrap);
-    window._tsLoad = function () {
-        turnstile.render('#_ts_box', {
-            sitekey: '__SITEKEY__',
-            callback: function(t) { window._tsToken = t; }
-        });
-    };
-    if (typeof turnstile !== 'undefined') {
-        window._tsLoad();
-    } else {
-        const s = document.createElement('script');
-        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=_tsLoad&render=explicit';
-        s.async = true;
-        document.head.appendChild(s);
-    }
-})();
-"""
-
-_GET_TOKEN_JS = """
-(() => {
-    if (window._tsToken) return window._tsToken;
-    // Match either the manual-render host (#_ts_box) or the auto-render
-    // host (div.cf-turnstile). The route-intercept path uses the latter.
-    const inp = document.querySelector('[name="cf-turnstile-response"]');
-    return (inp && inp.value) ? inp.value : null;
-})()
-"""
-
-_GET_IFRAME_RECT_JS = """
-(() => {
-    for (const f of document.querySelectorAll('iframe')) {
-        const src = f.src || f.getAttribute('src') || '';
-        if (!src.includes('challenges.cloudflare.com')) continue;
-        const r = f.getBoundingClientRect();
-        if (r.width > 50 && r.height > 20) return {x:r.x, y:r.y, w:r.width, h:r.height};
-    }
-    return null;
-})()
-"""
 
 _IS_CHALLENGE_JS = """
 (() => {
@@ -216,144 +188,57 @@ _IS_CHALLENGE_JS = """
 """
 
 
-# HTML body served at the intercepted siteurl. The <div class="cf-turnstile">
-# is auto-discovered and rendered by api.js without a manual render() call,
-# so we never touch the widget's main-world JS - side-steps Camoufox's
-# isolated-world sandbox. Based on the Theyka/Turnstile-Solver approach.
-_HOST_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>.</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</head><body>
-<div class="cf-turnstile" data-sitekey="__SITEKEY__"__EXTRA__></div>
-</body></html>"""
-
-
 async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
                               timeout: int, action: Optional[str] = None,
                               cdata: Optional[str] = None) -> str:
-    """Solve Turnstile on `siteurl` and return the token.
-
-    Two-phase strategy:
-      1. Navigate to the real siteurl. If the page already has a
-         cf-turnstile widget (its sitekey matches what the caller asked
-         for), wait for the token there — this is the path that works
-         for sitekeys CF binds to a specific domain.
-      2. If the real page has no matching widget, fall back to the old
-         route-intercept path: serve a minimal HTML body carrying a
-         cf-turnstile div with the requested sitekey. Works for
-         development/test sitekeys with no domain binding.
-    """
+    """Solve Turnstile via route-intercepted host HTML (Boterdrop pattern)."""
     loop = asyncio.get_event_loop()
     t0 = loop.time()
 
-    # Phase 1: navigate to the real siteurl. Most production sitekeys
-    # are domain-bound — CF only issues a token when the widget runs on
-    # a whitelisted origin. Use the page as-is when its widget already
-    # matches the caller's sitekey.
-    real_widget = False
+    target = siteurl if siteurl.endswith("/") else siteurl + "/"
+
+    widget_div = (
+        f'<div class="cf-turnstile" style="background:white;" data-sitekey="{sitekey}"'
+        + (f' data-action="{action}"' if action else "")
+        + (f' data-cdata="{cdata}"' if cdata else "")
+        + "></div>"
+    )
+    body = _HOST_HTML.replace("__WIDGET__", widget_div)
+
     try:
-        await page.goto(siteurl, timeout=20_000, wait_until="domcontentloaded")
-        real_widget = await page.evaluate(
-            f"() => !!document.querySelector('.cf-turnstile[data-sitekey=\"{sitekey}\"]')"
+        await page.unroute_all()
+    except Exception:
+        pass
+    await page.route(target, lambda route: route.fulfill(body=body, status=200))
+    await page.goto(target)
+    _step(req_id, f"route intercepted {target}")
+
+    # CSS hack from Boterdrop — narrowing the cf-turnstile div makes
+    # the click coords land on the checkbox hit area in invisible mode.
+    try:
+        await page.eval_on_selector(
+            "//div[@class='cf-turnstile']", "el => el.style.width = '70px'"
         )
-        if real_widget:
-            _step(req_id, f"using real page widget ({loop.time() - t0:.1f}s)")
-            # Wait for the CF iframe to actually mount. On headless
-            # Camoufox the page can land before api.js does its work.
-            try:
-                await page.wait_for_function(
-                    "() => !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')",
-                    timeout=10_000,
-                )
-                _step(req_id, f"iframe inserted ({loop.time() - t0:.1f}s)")
-            except Exception:
-                diag = await page.evaluate(
-                    """() => ({
-                        widgets: document.querySelectorAll('.cf-turnstile').length,
-                        iframes: document.querySelectorAll('iframe').length,
-                        api: typeof window.turnstile,
-                        ua: navigator.userAgent.slice(0, 80),
-                    })"""
-                )
-                _step(req_id, f"iframe wait timeout, diag: {diag}")
-    except Exception as e:
-        _step(req_id, f"real-page goto warn: {e}")
+    except Exception:
+        pass
 
-    # Phase 2: route-intercept fallback for sitekeys without domain
-    # binding (test sitekeys, dev keys). Re-serves the siteurl with our
-    # own minimal host HTML.
-    if not real_widget:
-        extra = ""
-        if action:
-            extra += f' data-action="{action}"'
-        if cdata:
-            extra += f' data-cdata="{cdata}"'
-        body = _HOST_HTML.replace("__SITEKEY__", sitekey).replace("__EXTRA__", extra)
-
-        target = siteurl if siteurl.endswith("/") else siteurl + "/"
-
-        async def _fulfill(route):
-            try:
-                await route.fulfill(status=200, content_type="text/html", body=body)
-            except Exception:
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
-
-        await page.route(target, _fulfill)
-        _step(req_id, f"route intercepted {target}")
-
-        try:
-            await page.goto(target, timeout=15_000)
-        except Exception as e:
-            _step(req_id, f"goto warn: {e}")
-
+    # 80 x 0.3s = 24s default; we follow the caller's timeout instead.
     deadline = t0 + timeout
-    poll = 0.2
-    clicks = 0
-    last_click = 0.0
-    iframe_seen = False
+    poll = 0.3
     while loop.time() < deadline:
-        # Cheap evaluate-based token probe — avoids the per-poll locator
-        # round-trip that used to spam the Playwright pipe.
         try:
-            val = await page.evaluate(_GET_TOKEN_JS)
+            value = await page.input_value("[name=cf-turnstile-response]", timeout=400)
         except Exception:
-            val = None
-        if val:
+            value = None
+        if value:
             _step(req_id, f"token obtained ({loop.time() - t0:.1f}s)")
-            return val
-
-        # Real interactive Turnstile renders a checkbox inside the
-        # CF-hosted iframe. Click into the iframe by absolute coords —
-        # the parent .cf-turnstile div doesn't dispatch the right event.
+            return value
+        # Click the parent div to coax invisible widgets into firing.
         try:
-            rect = await page.evaluate(_GET_IFRAME_RECT_JS)
+            await page.locator("//div[@class='cf-turnstile']").click(timeout=400)
         except Exception:
-            rect = None
-        if rect and not iframe_seen:
-            _step(req_id, f"iframe mounted ({loop.time() - t0:.1f}s)")
-            iframe_seen = True
-        now = loop.time()
-        if rect and clicks < 4 and (clicks == 0 or now - last_click > 4):
-            cx = rect["x"] + 28 + random.uniform(-3, 3)
-            cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
-            try:
-                await page.mouse.move(cx - 50, cy - 18)
-                await asyncio.sleep(0.04)
-                await page.mouse.move(cx, cy)
-                await asyncio.sleep(0.03)
-                await page.mouse.click(cx, cy)
-                _step(req_id, f"click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
-                clicks += 1
-                last_click = now
-            except Exception as e:
-                _step(req_id, f"click error: {e}")
-
+            pass
         await asyncio.sleep(poll)
-        if poll < 0.4:
-            poll = min(0.4, poll * 1.15)
 
     raise TimeoutError(f"turnstile timeout after {timeout}s")
 
@@ -371,70 +256,9 @@ def _is_dead_browser_error(exc: BaseException) -> bool:
     return any(h in msg for h in _DEAD_BROWSER_HINTS)
 
 
-def _turnstile_fallback() -> tuple[Optional[str], Optional[str]]:
-    """Return (base_url, apikey) for the external Turnstile fallback API.
-
-    Both pulled from env. The base URL is expected to be the prefix up
-    to (and including) the path; we append the standard query params.
-    Configured via TURNSTILE_FALLBACK_URL + TURNSTILE_FALLBACK_KEY.
-    """
-    url = (os.environ.get("TURNSTILE_FALLBACK_URL") or "").strip()
-    key = (os.environ.get("TURNSTILE_FALLBACK_KEY") or "").strip()
-    return (url or None), (key or None)
-
-
-async def _solve_via_fallback(sitekey: str, siteurl: str, req_id: str,
-                               timeout: int) -> Optional[str]:
-    base, apikey = _turnstile_fallback()
-    if not base or not apikey:
-        return None
-    from urllib.parse import urlencode
-    qs = urlencode({"apikey": apikey, "url": siteurl, "sitekey": sitekey})
-    full = f"{base}{'&' if '?' in base else '?'}{qs}"
-    _step(req_id, "delegating to turnstile fallback")
-    loop = asyncio.get_event_loop()
-    t0 = loop.time()
-    try:
-        conn_timeout = aiohttp.ClientTimeout(total=max(15, timeout + 10))
-        async with aiohttp.ClientSession(timeout=conn_timeout) as s:
-            async with s.get(full) as resp:
-                txt = await resp.text()
-                if resp.status != 200:
-                    raise RuntimeError(f"fallback HTTP {resp.status}")
-                try:
-                    data = json.loads(txt)
-                except Exception:
-                    raise RuntimeError(f"fallback non-JSON response")
-        # Accept a handful of common shapes — depends on the upstream API.
-        token = (
-            data.get("token")
-            or data.get("turnstile_token")
-            or (data.get("result") if isinstance(data.get("result"), str) else None)
-            or (data.get("data") or {}).get("token")
-            or (data.get("data") or {}).get("turnstile_token")
-        )
-        if not token:
-            raise RuntimeError(f"fallback returned no token: {str(data)[:160]}")
-        _step(req_id, f"fallback token ({loop.time() - t0:.1f}s)")
-        return token
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"fallback did not respond within {timeout + 10}s")
-
-
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       timeout: int = 45, action: Optional[str] = None,
                       cdata: Optional[str] = None) -> str:
-    # External fallback first when configured. The local browser path is
-    # the safety net so callers never lose a solve when the API is down.
-    fb_url, fb_key = _turnstile_fallback()
-    if fb_url and fb_key:
-        try:
-            token = await _solve_via_fallback(sitekey, siteurl, req_id, timeout)
-            if token:
-                return token
-        except Exception as e:
-            _step(req_id, f"fallback failed, using local browser: {e}")
-
     pool = await get_pool()
     async with pool.sem:
         async with pool.solve_lock:
@@ -456,6 +280,10 @@ async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                 finally:
                     pool.solve_count += 1
                     if page is not None:
+                        try:
+                            await page.unroute_all()
+                        except Exception:
+                            pass
                         try:
                             await page.close()
                         except Exception:

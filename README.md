@@ -2,22 +2,25 @@
 
 Local HTTP service that solves Cloudflare Turnstile widgets and clears
 Cloudflare "Just a moment..." JS / interactive challenges. Built on
-[Camoufox](https://github.com/daijro/camoufox) (stealth Firefox) for the
-Turnstile widget path and [Byparr](https://github.com/ThePhaseless/Byparr)
+[Pydoll](https://github.com/autoscrape-labs/pydoll) (CDP-direct Chromium
+automation) for the Turnstile widget path and
+[Byparr](https://github.com/ThePhaseless/Byparr)
 (Camoufox + playwright-captcha) for the JS-challenge path, behind a single
 unified HTTP API.
 
 ## Features
 
 - `POST /solve` — solves a Turnstile widget and returns the token. Uses a
-  warm Camoufox BrowserContext with a persistent profile.
+  warm Pydoll Chromium instance with a persistent user-data-dir. Uses
+  Pydoll's built-in `expect_and_bypass_cloudflare_captcha` shadow-root
+  detection + click for the actual interaction.
 - `POST /solve-challenge` — clears a Cloudflare JS or interactive challenge
   and returns the final URL, title, cookies (filtered to the target
   domain), user-agent, and full HTML. Delegates to a bundled Byparr
   instance (FlareSolverr-compatible protocol); falls back to the
-  in-process Camoufox path if the proxy is unreachable.
+  in-process Pydoll path if the proxy is unreachable.
 - Browser is **warmed at startup** so the first request doesn't pay a
-  cold-start penalty (~13s once vs 30s per first-request previously).
+  cold-start penalty.
 - Sanitised error responses with stable `error_code` field — internal
   Playwright/Camoufox stack traces stay in the server log only.
 - Bounded request body (default 64 KB) and `siteurl` validation
@@ -29,13 +32,14 @@ unified HTTP API.
 - `docker compose up -d` brings up both services with health-gated
   startup.
 
-### Why Camoufox + Byparr?
+### Why Pydoll + Byparr?
 
-`nodriver` / Patchright / stock Chromium are fingerprinted by current
-Cloudflare deployments — the Turnstile iframe simply never mounts on
-those builds. Camoufox uses a hardened Firefox build with realistic OS
-fingerprints and a built-in human-like mouse model that reliably clears
-the widget.
+Pydoll talks CDP directly over a WebSocket — no WebDriver, no
+Playwright Node driver, no `navigator.webdriver` flag. That means the
+driver-side bug class that killed the previous Camoufox+Playwright
+stack on real Cloudflare pages (`pageError.location.url` crash) can't
+reach us. Pydoll also ships a built-in Cloudflare Turnstile bypass
+(shadow-root inspection + click) which we wire into every `/solve`.
 
 For the heavier JS-challenge path, Byparr ships its own Camoufox-based
 worker that actively tracks CF protocol changes; it clears those pages
@@ -43,11 +47,20 @@ in 10–20 s on a cold profile. Byparr exposes a FlareSolverr-compatible
 API (`POST /v1` with `cmd: request.get`), so swapping to FlareSolverr
 later is one env var.
 
+#### Sitekey domain binding
+
+Cloudflare binds most production Turnstile sitekeys to the origin they
+were issued for. `/solve` therefore navigates to the real `siteurl`
+and uses the widget rendered there. If the page doesn't render the
+requested sitekey, we return an error rather than forging a fake host
+page — a forged origin won't yield a valid token anyway. Pass the URL
+that actually hosts the sitekey.
+
 ## Requirements
 
 - Docker and Docker Compose, **or**
-- Python 3.11+ (tested on 3.13). Camoufox bundles its own Firefox
-  binary via `python -m camoufox fetch`.
+- Python 3.11+ (tested on 3.13) and a Chromium binary
+  (`/usr/bin/chromium` or pointed via `CHROME_PATH`).
 
 ## Quick start
 
@@ -75,9 +88,9 @@ curl http://localhost:9988/health
 
 Remove the `byparr` service and the `CHALLENGE_PROXY_URL` env from
 `docker-compose.yml`, or set `CHALLENGE_PROXY_URL=""`. `/solve-challenge`
-will then run the pure-Camoufox path. Expect higher latency and more
-timeouts on hosts where Cloudflare fingerprints Firefox-with-Xvfb — see
-the section above.
+will then run the pure-Pydoll path. Expect higher latency and more
+timeouts on hosts where Cloudflare's interactive challenge page resists
+headless Chromium.
 
 ### Plain Docker
 
@@ -101,10 +114,10 @@ across container restarts.
 ### Host install (optional)
 
 ```bash
+sudo apt install chromium  # or set CHROME_PATH to your binary
 pip install -r requirements.txt
-python -m camoufox fetch
 # Byparr is optional; without it /solve-challenge runs the in-process
-# Camoufox path only.
+# Pydoll path only.
 export CHALLENGE_PROXY_URL=http://localhost:8191   # if running Byparr locally
 export CHALLENGE_PROXY_KIND=byparr
 python service.py
@@ -123,10 +136,9 @@ Environment variables:
 | `CHALLENGE_PROXY_URL`   | _(unset)_         | Base URL of a Byparr/FlareSolverr instance. When set, `/solve-challenge` delegates to it.         |
 | `CHALLENGE_PROXY_KIND`  | `byparr`          | `byparr` (timeouts in seconds) or `flaresolverr` (timeouts in ms). Auto-set when only `FLARESOLVERR_URL` is provided. |
 | `FLARESOLVERR_URL`      | _(unset)_         | Back-compat alias for `CHALLENGE_PROXY_URL` with `KIND=flaresolverr`                              |
-| `TS_PROFILE_DIR`        | `/tmp/ts_profile` | Persistent Camoufox profile directory                                                             |
-| `CAMOUFOX_HEADLESS`     | `virtual`         | `virtual` (Camoufox-managed Xvfb), `true`, or `false`                                             |
-| `TURNSTILE_FALLBACK_URL`| _(unset)_         | Optional external Turnstile solver API. When both this and `TURNSTILE_FALLBACK_KEY` are set, `/solve` tries the API first and falls back to the local browser on failure. Useful for production sitekeys where the local headless browser fails. |
-| `TURNSTILE_FALLBACK_KEY`| _(unset)_         | API key for the fallback solver. Read from `.env` (gitignored) — see `.env.example`.              |
+| `TS_PROFILE_DIR`        | `/tmp/ts_profile` | Persistent Chromium user-data-dir                                                                 |
+| `HEADLESS`              | `true`            | `true` runs Chromium with `--headless=new`. `false` opts into headed mode (Xvfb at `:99`).        |
+| `CHROME_PATH`           | `/usr/bin/chromium` | Path to the Chromium binary (overridable for headed/Chrome-stable runs).                        |
 
 ## API
 
@@ -288,11 +300,11 @@ inside the service.
 
 Typical throughput on a warm browser:
 
-- Turnstile (`/solve`), always-pass demo: ~6 s end-to-end
-- Turnstile (`/solve`), real sitekey: 8–15 s typical
+- Turnstile (`/solve`), always-pass demo: 4–8 s end-to-end
+- Turnstile (`/solve`), real sitekey: depends entirely on the target
+  page; the solver itself adds ~2 s on top of CF's own clearance time
 - JS challenge via Byparr: ~15 s per solve (single Byparr worker)
-- JS challenge via in-process Camoufox, warm profile: under 2 s
-- JS challenge via in-process Camoufox, cold profile: 8–12 s
+- JS challenge via in-process Pydoll, warm profile: 2–5 s
 
 Scaling beyond single-browser throughput requires multiple independent
 solver instances, each with its own warm profile and IP.
@@ -315,12 +327,12 @@ clearances.
 ## File layout
 
 ```
-solver.py            Core browser automation + Byparr delegation
+solver.py            Core browser automation (Pydoll) + Byparr delegation
 service.py           aiohttp HTTP wrapper, request logging, validation
-requirements.txt     Python dependencies (camoufox, aiohttp)
-Dockerfile           Container image (Python + Camoufox + Xvfb)
+requirements.txt     Python dependencies (pydoll-python, aiohttp)
+Dockerfile           Container image (Python + Chromium + Xvfb)
 docker-compose.yml   Compose stack: solver + byparr
-entrypoint.sh        Container entrypoint (clears stale X locks, starts service)
+entrypoint.sh        Container entrypoint (Xvfb fallback, starts service)
 web/                 Built-in playground UI
 ```
 

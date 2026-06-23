@@ -5,10 +5,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONWARNINGS=ignore \
     MAX_WORKERS=8 \
     PORT=9988 \
-    CAMOUFOX_HEADLESS=virtual
+    HEADLESS=false
 
-# System deps for Firefox + Camoufox's internal virtual display (Xvfb).
-# Camoufox bundles its own Firefox binary via `python -m camoufox fetch`.
+# System deps for headed Camoufox/Firefox under Xvfb. Real CF widgets
+# refuse to render on --headless=new builds (HeadlessChrome UA, missing
+# GPU/audio signals); running headed under Xvfb keeps the fingerprint
+# clean. Camoufox bundles its own Firefox via `python -m camoufox fetch`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         dumb-init \
