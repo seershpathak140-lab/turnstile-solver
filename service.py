@@ -6,12 +6,10 @@ import collections
 import json
 import logging
 import os
-import platform
-import subprocess
 import sys
 import time
 import uuid
-from typing import Optional
+from urllib.parse import urlparse
 
 from aiohttp import web
 
@@ -20,24 +18,15 @@ from solver import get_pool, solve_async, solve_challenge_async, _challenge_prox
 
 PORT = int(os.environ.get("PORT", 9988))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 8))
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 64 * 1024))  # 64 KB
+
+log = logging.getLogger("service")
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 TEMPLATE_DIR = os.path.join(WEB_DIR, "templates")
 STATIC_DIR = os.path.join(WEB_DIR, "static")
 
 _PROCESS_STARTED = time.time()
-
-
-def _ensure_display() -> Optional[subprocess.Popen]:
-    if platform.system() != "Linux" or os.environ.get("DISPLAY"):
-        return None
-    proc = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1280x900x24"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    os.environ["DISPLAY"] = ":99"
-    time.sleep(0.5)
-    return proc
 
 
 _stats = {"in_flight": 0, "solved": 0, "errors": 0, "challenges": 0}
@@ -51,6 +40,27 @@ _latency_ms: "collections.deque[float]" = collections.deque(maxlen=100)
 
 def _rid() -> str:
     return uuid.uuid4().hex[:8]
+
+
+def _classify_error(exc: BaseException) -> tuple[str, str, int]:
+    """Map an exception to (error_code, public_message, http_status).
+
+    Hides Playwright/Camoufox internal stack traces from clients while
+    keeping enough signal that callers can branch on the result.
+    """
+    msg = str(exc).strip()
+    low = msg.lower()
+    if isinstance(exc, TimeoutError) or "timeout" in low:
+        return "timeout", msg or "solve timeout", 504
+    if any(h in low for h in ("connection closed", "browser has been closed",
+                               "context has been closed", "net::err",
+                               "ns_error", "navigation timeout")):
+        return "browser_error", "browser unavailable, please retry", 503
+    if "invalid url" in low or "invalid_url" in low:
+        return "bad_request", "invalid siteurl", 400
+    if isinstance(exc, ValueError):
+        return "bad_request", msg or "bad request", 400
+    return "solver_error", "internal solver error", 500
 
 
 def _summary(body: dict) -> str:
@@ -102,6 +112,38 @@ def _emit_end(rid: str, elapsed: float, status: int, body: dict):
     )
 
 
+def _validate_siteurl(siteurl: str) -> None:
+    """Cheap guard against empty / non-http(s) / no-host URLs.
+
+    Defends the headless browser against attacker-controlled `file://` or
+    `chrome://` URLs and gives callers a clean 400 instead of a downstream
+    Playwright error.
+    """
+    if not siteurl:
+        raise ValueError("siteurl required")
+    try:
+        u = urlparse(siteurl)
+    except Exception:
+        raise ValueError("invalid siteurl")
+    if u.scheme not in ("http", "https"):
+        raise ValueError("siteurl scheme must be http or https")
+    if not u.hostname:
+        raise ValueError("siteurl missing host")
+
+
+async def _read_payload(request: web.Request) -> dict:
+    """Bounded-size JSON body parse. Raises ValueError on bad input."""
+    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+        raise ValueError("request body too large")
+    raw = await request.content.read(MAX_BODY_BYTES + 1)
+    if len(raw) > MAX_BODY_BYTES:
+        raise ValueError("request body too large")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("invalid JSON")
+
+
 async def handle_solve(request: web.Request) -> web.Response:
     rid = _rid()
     t0 = time.time()
@@ -110,9 +152,9 @@ async def handle_solve(request: web.Request) -> web.Response:
     peer = request.remote or "-"
 
     try:
-        payload = await request.json()
-    except Exception:
-        body = {"error": "invalid JSON"}
+        payload = await _read_payload(request)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
         _emit_start(rid, method, path, "", "", peer)
         _emit_end(rid, time.time() - t0, 400, body)
         _record_event(path, 400, time.time() - t0, "", body)
@@ -120,14 +162,24 @@ async def handle_solve(request: web.Request) -> web.Response:
 
     sitekey = (payload.get("sitekey") or "").strip()
     siteurl = (payload.get("siteurl") or "").strip()
-    timeout = int(payload.get("timeout", 45))
+    try:
+        timeout = max(5, min(180, int(payload.get("timeout", 45))))
+    except (TypeError, ValueError):
+        timeout = 45
     action = payload.get("action") or None
     cdata = payload.get("cdata") or None
 
     _emit_start(rid, method, path, siteurl, sitekey, peer)
 
-    if not sitekey or not siteurl:
-        body = {"error": "sitekey and siteurl required"}
+    if not sitekey:
+        body = {"error": "sitekey required", "error_code": "bad_request"}
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, siteurl, body)
+        return web.json_response(body, status=400)
+    try:
+        _validate_siteurl(siteurl)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
         _emit_end(rid, time.time() - t0, 400, body)
         _record_event(path, 400, time.time() - t0, siteurl, body)
         return web.json_response(body, status=400)
@@ -145,10 +197,13 @@ async def handle_solve(request: web.Request) -> web.Response:
     except Exception as exc:
         elapsed = time.time() - t0
         _stats["errors"] += 1
-        body = {"error": str(exc), "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, 500, body)
-        _record_event(path, 500, elapsed, siteurl, body)
-        return web.json_response(body, status=500)
+        code, public_msg, status = _classify_error(exc)
+        # Full detail to the server log; sanitised body to the client.
+        log.exception("solve failed rid=%s code=%s", rid, code)
+        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, status, body)
+        _record_event(path, status, elapsed, siteurl, body)
+        return web.json_response(body, status=status)
     finally:
         _stats["in_flight"] -= 1
 
@@ -161,21 +216,26 @@ async def handle_challenge(request: web.Request) -> web.Response:
     peer = request.remote or "-"
 
     try:
-        payload = await request.json()
-    except Exception:
-        body = {"error": "invalid JSON"}
+        payload = await _read_payload(request)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
         _emit_start(rid, method, path, "", "", peer)
         _emit_end(rid, time.time() - t0, 400, body)
         _record_event(path, 400, time.time() - t0, "", body)
         return web.json_response(body, status=400)
 
     siteurl = (payload.get("siteurl") or "").strip()
-    timeout = int(payload.get("timeout", 45))
+    try:
+        timeout = max(5, min(180, int(payload.get("timeout", 45))))
+    except (TypeError, ValueError):
+        timeout = 45
 
     _emit_start(rid, method, path, siteurl, "", peer)
 
-    if not siteurl:
-        body = {"error": "siteurl required"}
+    try:
+        _validate_siteurl(siteurl)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
         _emit_end(rid, time.time() - t0, 400, body)
         _record_event(path, 400, time.time() - t0, siteurl, body)
         return web.json_response(body, status=400)
@@ -192,10 +252,12 @@ async def handle_challenge(request: web.Request) -> web.Response:
     except Exception as exc:
         elapsed = time.time() - t0
         _stats["errors"] += 1
-        body = {"error": str(exc), "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, 500, body)
-        _record_event(path, 500, elapsed, siteurl, body)
-        return web.json_response(body, status=500)
+        code, public_msg, status = _classify_error(exc)
+        log.exception("challenge failed rid=%s code=%s", rid, code)
+        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, status, body)
+        _record_event(path, status, elapsed, siteurl, body)
+        return web.json_response(body, status=status)
     finally:
         _stats["in_flight"] -= 1
 
@@ -256,11 +318,15 @@ async def handle_stats(request: web.Request) -> web.Response:
 
 async def on_startup(app):
     proxy_url, proxy_kind = _challenge_proxy()
-    if proxy_url:
-        print(f"[solver] {proxy_kind} delegation enabled ({proxy_url}); browser lazy", flush=True)
-        return
+    # Always warm the browser at startup — /solve still routes through
+    # Camoufox even when a challenge proxy is configured. Lazy-loading the
+    # browser meant the first /solve paid a ~30s cold-start tax.
     pool = await get_pool(MAX_WORKERS)
-    print(f"[solver] browser ready, MAX_WORKERS={pool.max_concurrent}", flush=True)
+    if proxy_url:
+        print(f"[solver] {proxy_kind} delegation enabled ({proxy_url}); browser warm, "
+              f"MAX_WORKERS={pool.max_concurrent}", flush=True)
+    else:
+        print(f"[solver] browser warm, MAX_WORKERS={pool.max_concurrent}", flush=True)
 
 
 async def on_cleanup(app):
@@ -276,14 +342,16 @@ def main():
     os.environ.setdefault("PYTHONWARNINGS", "ignore")
     sys.stderr = sys.stdout
 
-    logging.basicConfig(level=logging.ERROR, stream=sys.stdout)
-    for name in ("solver", "service", "aiohttp.access", "aiohttp.server",
-                 "aiohttp.web", "nodriver", "nodriver.core.browser"):
-        logging.getLogger(name).setLevel(logging.ERROR)
-        logging.getLogger(name).propagate = False
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=log_level, stream=sys.stdout,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Keep the noisy libs quiet but let our own loggers through so
+    # `log.exception` is actually visible for debugging.
+    for name in ("aiohttp.access", "aiohttp.server", "aiohttp.web",
+                 "camoufox", "playwright", "nodriver", "nodriver.core.browser"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
-    xvfb = _ensure_display()
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_BODY_BYTES)
     app.router.add_get("/", handle_playground)
     app.router.add_post("/solve", handle_solve)
     app.router.add_post("/solve-challenge", handle_challenge)
@@ -294,11 +362,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     print(f"[solver] listening on http://0.0.0.0:{PORT}", flush=True)
-    try:
-        web.run_app(app, host="0.0.0.0", port=PORT, print=None, access_log=None)
-    finally:
-        if xvfb:
-            xvfb.terminate()
+    web.run_app(app, host="0.0.0.0", port=PORT, print=None, access_log=None)
 
 
 if __name__ == "__main__":

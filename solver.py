@@ -74,10 +74,33 @@ class BrowserSingleton:
         self.solve_count = 0
         self.stopped = False
 
+    def _is_alive(self) -> bool:
+        if self.browser is None or self.stopped:
+            return False
+        try:
+            b = getattr(self.browser, "browser", None)
+            if b is not None and hasattr(b, "is_connected"):
+                return bool(b.is_connected())
+            return True
+        except Exception:
+            return False
+
     async def ensure(self):
         async with self._start_lock:
-            if self.browser is not None and not self.stopped:
+            if self._is_alive():
                 return
+            # Stale handle from a crashed driver — tear it down before
+            # relaunching, otherwise the next new_page() reuses a dead
+            # connection and fails with "Connection closed".
+            if self.browser is not None or self._camoufox is not None:
+                log.warning("browser handle stale, relaunching camoufox")
+                try:
+                    if self._camoufox is not None:
+                        await self._camoufox.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                self._camoufox = None
+                self.browser = None
             profile = _get_profile_dir()
             os.makedirs(profile, exist_ok=True)
             log.info("launching camoufox profile=%s", profile)
@@ -164,7 +187,9 @@ _INJECT_JS_TEMPLATE = """
 _GET_TOKEN_JS = """
 (() => {
     if (window._tsToken) return window._tsToken;
-    const inp = document.querySelector('#_ts_box [name="cf-turnstile-response"]');
+    // Match either the manual-render host (#_ts_box) or the auto-render
+    // host (div.cf-turnstile). The route-intercept path uses the latter.
+    const inp = document.querySelector('[name="cf-turnstile-response"]');
     return (inp && inp.value) ? inp.value : null;
 })()
 """
@@ -244,27 +269,65 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
         _step(req_id, f"goto warn: {e}")
 
     deadline = t0 + timeout
-    clicked = False
+    poll = 0.2
+    clicks = 0
+    last_click = 0.0
+    iframe_seen = False
     while loop.time() < deadline:
+        # Cheap evaluate-based token probe — avoids the per-poll locator
+        # round-trip that used to spam the Playwright pipe.
         try:
-            val = await page.locator('[name=cf-turnstile-response]').first.get_attribute("value", timeout=500)
+            val = await page.evaluate(_GET_TOKEN_JS)
         except Exception:
             val = None
         if val:
             _step(req_id, f"token obtained ({loop.time() - t0:.1f}s)")
             return val
 
-        if not clicked:
+        # Real interactive Turnstile renders a checkbox inside the
+        # CF-hosted iframe. Click into the iframe by absolute coords —
+        # the parent .cf-turnstile div doesn't dispatch the right event.
+        try:
+            rect = await page.evaluate(_GET_IFRAME_RECT_JS)
+        except Exception:
+            rect = None
+        if rect and not iframe_seen:
+            _step(req_id, f"iframe mounted ({loop.time() - t0:.1f}s)")
+            iframe_seen = True
+        now = loop.time()
+        if rect and clicks < 4 and (clicks == 0 or now - last_click > 4):
+            cx = rect["x"] + 28 + random.uniform(-3, 3)
+            cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
             try:
-                await page.locator(".cf-turnstile").first.click(timeout=2_000)
-                _step(req_id, f"clicked widget ({loop.time() - t0:.1f}s)")
-                clicked = True
-            except Exception:
-                pass
+                await page.mouse.move(cx - 50, cy - 18)
+                await asyncio.sleep(0.04)
+                await page.mouse.move(cx, cy)
+                await asyncio.sleep(0.03)
+                await page.mouse.click(cx, cy)
+                _step(req_id, f"click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
+                clicks += 1
+                last_click = now
+            except Exception as e:
+                _step(req_id, f"click error: {e}")
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(poll)
+        if poll < 0.4:
+            poll = min(0.4, poll * 1.15)
 
     raise TimeoutError(f"turnstile timeout after {timeout}s")
+
+
+_DEAD_BROWSER_HINTS = (
+    "connection closed",
+    "browser has been closed",
+    "target page, context or browser has been closed",
+    "browser context has been closed",
+)
+
+
+def _is_dead_browser_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(h in msg for h in _DEAD_BROWSER_HINTS)
 
 
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
@@ -274,20 +337,28 @@ async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
     async with pool.sem:
         async with pool.solve_lock:
             _step(req_id, f"opening tab for {siteurl}")
-            page = None
-            try:
-                await pool.ensure()
-                page = await pool.browser.new_page()
-                return await _turnstile_on_page(
-                    page, sitekey, siteurl, req_id, timeout, action, cdata
-                )
-            finally:
-                pool.solve_count += 1
-                if page is not None:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+            for attempt in (1, 2):
+                page = None
+                try:
+                    await pool.ensure()
+                    page = await pool.browser.new_page()
+                    return await _turnstile_on_page(
+                        page, sitekey, siteurl, req_id, timeout, action, cdata
+                    )
+                except Exception as exc:
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown()
+                        continue
+                    raise
+                finally:
+                    pool.solve_count += 1
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+            raise RuntimeError("solve_async: unreachable")
 
 
 # ---------- JS Challenge ("Just a moment...") ----------
