@@ -231,42 +231,83 @@ _HOST_HTML = """<!doctype html>
 async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
                               timeout: int, action: Optional[str] = None,
                               cdata: Optional[str] = None) -> str:
-    """Inject Turnstile on an intercepted siteurl and return the token.
+    """Solve Turnstile on `siteurl` and return the token.
 
-    We route-intercept the exact siteurl and fulfill it with a minimal
-    HTML body carrying a cf-turnstile div with the requested sitekey.
-    api.js auto-renders the widget, so the main-world JS never needs to
-    be reached - sidesteps Camoufox's isolated-world sandbox. Referer
-    and origin still match siteurl so CF issues a valid token.
+    Two-phase strategy:
+      1. Navigate to the real siteurl. If the page already has a
+         cf-turnstile widget (its sitekey matches what the caller asked
+         for), wait for the token there — this is the path that works
+         for sitekeys CF binds to a specific domain.
+      2. If the real page has no matching widget, fall back to the old
+         route-intercept path: serve a minimal HTML body carrying a
+         cf-turnstile div with the requested sitekey. Works for
+         development/test sitekeys with no domain binding.
     """
     loop = asyncio.get_event_loop()
     t0 = loop.time()
 
-    extra = ""
-    if action:
-        extra += f' data-action="{action}"'
-    if cdata:
-        extra += f' data-cdata="{cdata}"'
-    body = _HOST_HTML.replace("__SITEKEY__", sitekey).replace("__EXTRA__", extra)
-
-    target = siteurl if siteurl.endswith("/") else siteurl + "/"
-
-    async def _fulfill(route):
-        try:
-            await route.fulfill(status=200, content_type="text/html", body=body)
-        except Exception:
-            try:
-                await route.continue_()
-            except Exception:
-                pass
-
-    await page.route(target, _fulfill)
-    _step(req_id, f"route intercepted {target}")
-
+    # Phase 1: navigate to the real siteurl. Most production sitekeys
+    # are domain-bound — CF only issues a token when the widget runs on
+    # a whitelisted origin. Use the page as-is when its widget already
+    # matches the caller's sitekey.
+    real_widget = False
     try:
-        await page.goto(target, timeout=15_000)
+        await page.goto(siteurl, timeout=20_000, wait_until="domcontentloaded")
+        real_widget = await page.evaluate(
+            f"() => !!document.querySelector('.cf-turnstile[data-sitekey=\"{sitekey}\"]')"
+        )
+        if real_widget:
+            _step(req_id, f"using real page widget ({loop.time() - t0:.1f}s)")
+            # Wait for the CF iframe to actually mount. On headless
+            # Camoufox the page can land before api.js does its work.
+            try:
+                await page.wait_for_function(
+                    "() => !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')",
+                    timeout=10_000,
+                )
+                _step(req_id, f"iframe inserted ({loop.time() - t0:.1f}s)")
+            except Exception:
+                diag = await page.evaluate(
+                    """() => ({
+                        widgets: document.querySelectorAll('.cf-turnstile').length,
+                        iframes: document.querySelectorAll('iframe').length,
+                        api: typeof window.turnstile,
+                        ua: navigator.userAgent.slice(0, 80),
+                    })"""
+                )
+                _step(req_id, f"iframe wait timeout, diag: {diag}")
     except Exception as e:
-        _step(req_id, f"goto warn: {e}")
+        _step(req_id, f"real-page goto warn: {e}")
+
+    # Phase 2: route-intercept fallback for sitekeys without domain
+    # binding (test sitekeys, dev keys). Re-serves the siteurl with our
+    # own minimal host HTML.
+    if not real_widget:
+        extra = ""
+        if action:
+            extra += f' data-action="{action}"'
+        if cdata:
+            extra += f' data-cdata="{cdata}"'
+        body = _HOST_HTML.replace("__SITEKEY__", sitekey).replace("__EXTRA__", extra)
+
+        target = siteurl if siteurl.endswith("/") else siteurl + "/"
+
+        async def _fulfill(route):
+            try:
+                await route.fulfill(status=200, content_type="text/html", body=body)
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await page.route(target, _fulfill)
+        _step(req_id, f"route intercepted {target}")
+
+        try:
+            await page.goto(target, timeout=15_000)
+        except Exception as e:
+            _step(req_id, f"goto warn: {e}")
 
     deadline = t0 + timeout
     poll = 0.2
@@ -330,9 +371,70 @@ def _is_dead_browser_error(exc: BaseException) -> bool:
     return any(h in msg for h in _DEAD_BROWSER_HINTS)
 
 
+def _turnstile_fallback() -> tuple[Optional[str], Optional[str]]:
+    """Return (base_url, apikey) for the external Turnstile fallback API.
+
+    Both pulled from env. The base URL is expected to be the prefix up
+    to (and including) the path; we append the standard query params.
+    Configured via TURNSTILE_FALLBACK_URL + TURNSTILE_FALLBACK_KEY.
+    """
+    url = (os.environ.get("TURNSTILE_FALLBACK_URL") or "").strip()
+    key = (os.environ.get("TURNSTILE_FALLBACK_KEY") or "").strip()
+    return (url or None), (key or None)
+
+
+async def _solve_via_fallback(sitekey: str, siteurl: str, req_id: str,
+                               timeout: int) -> Optional[str]:
+    base, apikey = _turnstile_fallback()
+    if not base or not apikey:
+        return None
+    from urllib.parse import urlencode
+    qs = urlencode({"apikey": apikey, "url": siteurl, "sitekey": sitekey})
+    full = f"{base}{'&' if '?' in base else '?'}{qs}"
+    _step(req_id, "delegating to turnstile fallback")
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    try:
+        conn_timeout = aiohttp.ClientTimeout(total=max(15, timeout + 10))
+        async with aiohttp.ClientSession(timeout=conn_timeout) as s:
+            async with s.get(full) as resp:
+                txt = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"fallback HTTP {resp.status}")
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    raise RuntimeError(f"fallback non-JSON response")
+        # Accept a handful of common shapes — depends on the upstream API.
+        token = (
+            data.get("token")
+            or data.get("turnstile_token")
+            or (data.get("result") if isinstance(data.get("result"), str) else None)
+            or (data.get("data") or {}).get("token")
+            or (data.get("data") or {}).get("turnstile_token")
+        )
+        if not token:
+            raise RuntimeError(f"fallback returned no token: {str(data)[:160]}")
+        _step(req_id, f"fallback token ({loop.time() - t0:.1f}s)")
+        return token
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"fallback did not respond within {timeout + 10}s")
+
+
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       timeout: int = 45, action: Optional[str] = None,
                       cdata: Optional[str] = None) -> str:
+    # External fallback first when configured. The local browser path is
+    # the safety net so callers never lose a solve when the API is down.
+    fb_url, fb_key = _turnstile_fallback()
+    if fb_url and fb_key:
+        try:
+            token = await _solve_via_fallback(sitekey, siteurl, req_id, timeout)
+            if token:
+                return token
+        except Exception as e:
+            _step(req_id, f"fallback failed, using local browser: {e}")
+
     pool = await get_pool()
     async with pool.sem:
         async with pool.solve_lock:

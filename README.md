@@ -125,6 +125,8 @@ Environment variables:
 | `FLARESOLVERR_URL`      | _(unset)_         | Back-compat alias for `CHALLENGE_PROXY_URL` with `KIND=flaresolverr`                              |
 | `TS_PROFILE_DIR`        | `/tmp/ts_profile` | Persistent Camoufox profile directory                                                             |
 | `CAMOUFOX_HEADLESS`     | `virtual`         | `virtual` (Camoufox-managed Xvfb), `true`, or `false`                                             |
+| `TURNSTILE_FALLBACK_URL`| _(unset)_         | Optional external Turnstile solver API. When both this and `TURNSTILE_FALLBACK_KEY` are set, `/solve` tries the API first and falls back to the local browser on failure. Useful for production sitekeys where the local headless browser fails. |
+| `TURNSTILE_FALLBACK_KEY`| _(unset)_         | API key for the fallback solver. Read from `.env` (gitignored) — see `.env.example`.              |
 
 ## API
 
