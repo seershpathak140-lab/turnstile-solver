@@ -37,7 +37,7 @@ services:
       TZ: "Asia/Jakarta"
     shm_size: "1gb"
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8191/docs\",timeout=3).status==200 else 1)'"]
+      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://127.0.0.1:8191/docs"]
       interval: 30s
       timeout: 10s
       retries: 5
