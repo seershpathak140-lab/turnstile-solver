@@ -544,6 +544,126 @@ async def solve_challenge_async(siteurl: str, req_id: str = "-",
             raise RuntimeError("solve_challenge_async: unreachable")
 
 
+# ---------- reCAPTCHA v3 (Boterdrop pattern) ----------
+
+_RECAPTCHA_READY_JS = """
+() => typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'
+"""
+
+_RECAPTCHA_INJECT_JS = """
+(key) => new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://www.google.com/recaptcha/api.js?render=' + key;
+    s.onload = () => {
+        const i = setInterval(() => {
+            if (typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') {
+                clearInterval(i); res(true);
+            }
+        }, 100);
+        setTimeout(() => { clearInterval(i); rej(new Error('recaptcha inject timeout')); }, 10000);
+    };
+    s.onerror = () => rej(new Error('recaptcha script load failed'));
+    document.head.appendChild(s);
+})
+"""
+
+_RECAPTCHA_EXEC_JS = """
+([key, act]) => new Promise((res, rej) => {
+    grecaptcha.ready(() => {
+        grecaptcha.execute(key, { action: act }).then(res)
+            .catch(e => rej(new Error(e.message || 'recaptcha execute failed')));
+    });
+})
+"""
+
+
+async def solve_recaptcha_v3_async(sitekey: str, siteurl: str, req_id: str = "-",
+                                    timeout: int = 45, action: str = "verify") -> str:
+    """Load the target page, ensure grecaptcha is present (inject api.js if
+    not), then run grecaptcha.execute to mint a v3 token. Score-based, so a
+    clean Camoufox fingerprint + WARP egress is what makes it pass."""
+    pool = await get_pool()
+    async with pool.sem:
+        async with pool.solve_lock:
+            for attempt in (1, 2):
+                page = None
+                try:
+                    _step(req_id, f"recaptcha v3 -> {siteurl} (action={action})")
+                    page = await pool.new_page(siteurl)
+                    if not await page.evaluate(_RECAPTCHA_READY_JS):
+                        _step(req_id, "grecaptcha absent, injecting api.js")
+                        await page.evaluate(_RECAPTCHA_INJECT_JS, sitekey)
+                    token = await page.evaluate(_RECAPTCHA_EXEC_JS, [sitekey, action])
+                    if not token:
+                        raise RuntimeError("recaptcha returned empty token")
+                    _step(req_id, "recaptcha token obtained")
+                    return token
+                except Exception as exc:
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown()
+                        continue
+                    raise
+                finally:
+                    pool.solve_count += 1
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+            raise RuntimeError("solve_recaptcha_v3_async: unreachable")
+
+
+# ---------- AWS WAF token (Boterdrop pattern) ----------
+
+async def solve_aws_token_async(siteurl: str, req_id: str = "-",
+                                 timeout: int = 45) -> dict:
+    """Navigate to the target and poll for the `aws-waf-token` cookie that
+    the AWS WAF challenge JS sets once it clears. Returns the cookie + UA."""
+    pool = await get_pool()
+    async with pool.sem:
+        async with pool.solve_lock:
+            for attempt in (1, 2):
+                page = None
+                try:
+                    _step(req_id, f"aws-waf -> {siteurl}")
+                    page = await pool.new_page(siteurl)
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + timeout
+                    token = None
+                    while loop.time() < deadline:
+                        cookies = await pool.browser.cookies()
+                        token = next((c for c in cookies
+                                      if c.get("name") == "aws-waf-token"), None)
+                        if token:
+                            break
+                        await asyncio.sleep(1)
+                    if not token:
+                        raise TimeoutError(f"aws-waf-token not set within {timeout}s")
+                    user_agent = await page.evaluate("navigator.userAgent")
+                    _step(req_id, "aws-waf-token obtained")
+                    return {
+                        "token": token.get("value"),
+                        "cookie": f"aws-waf-token={token.get('value')}",
+                        "user_agent": user_agent,
+                        "url": page.url,
+                    }
+                except Exception as exc:
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown()
+                        continue
+                    raise
+                finally:
+                    pool.solve_count += 1
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+            raise RuntimeError("solve_aws_token_async: unreachable")
+
+
 def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:
     """Legacy sync wrapper."""
     import warnings

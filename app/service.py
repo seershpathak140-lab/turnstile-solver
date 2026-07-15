@@ -13,7 +13,9 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from .solver import get_pool, solve_async, solve_challenge_async, _challenge_proxy
+from .solver import (get_pool, solve_async, solve_challenge_async,
+                     solve_recaptcha_v3_async, solve_aws_token_async,
+                     _challenge_proxy)
 
 
 PORT = int(os.environ.get("PORT", 9988))
@@ -284,6 +286,120 @@ async def handle_challenge(request: web.Request) -> web.Response:
         _stats["in_flight"] -= 1
 
 
+async def handle_recaptcha(request: web.Request) -> web.Response:
+    rid = _rid()
+    t0 = time.time()
+    path = request.path
+    peer = request.remote or "-"
+
+    try:
+        payload = await _read_payload(request)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
+        _emit_start(rid, request.method, path, "", "", peer)
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, "", body)
+        return web.json_response(body, status=400)
+
+    sitekey = (payload.get("sitekey") or "").strip()
+    siteurl = (payload.get("siteurl") or "").strip()
+    action = (payload.get("action") or "verify").strip()
+    try:
+        timeout = max(5, min(180, int(payload.get("timeout", 45))))
+    except (TypeError, ValueError):
+        timeout = 45
+
+    _emit_start(rid, request.method, path, siteurl, sitekey, peer)
+
+    if not sitekey:
+        body = {"error": "sitekey required", "error_code": "bad_request"}
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, siteurl, body)
+        return web.json_response(body, status=400)
+    try:
+        _validate_siteurl(siteurl)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, siteurl, body)
+        return web.json_response(body, status=400)
+
+    _stats["in_flight"] += 1
+    try:
+        token = await solve_recaptcha_v3_async(sitekey, siteurl, req_id=rid,
+                                               timeout=timeout, action=action)
+        elapsed = time.time() - t0
+        _stats["solved"] += 1
+        body = {"token": token, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, 200, body)
+        _record_event(path, 200, elapsed, siteurl, body)
+        return web.json_response(body)
+    except Exception as exc:
+        elapsed = time.time() - t0
+        _stats["errors"] += 1
+        code, public_msg, status = _classify_error(exc)
+        log.exception("recaptcha failed rid=%s code=%s", rid, code)
+        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, status, body)
+        _record_event(path, status, elapsed, siteurl, body)
+        return web.json_response(body, status=status)
+    finally:
+        _stats["in_flight"] -= 1
+
+
+async def handle_aws_token(request: web.Request) -> web.Response:
+    rid = _rid()
+    t0 = time.time()
+    path = request.path
+    peer = request.remote or "-"
+
+    try:
+        payload = await _read_payload(request)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
+        _emit_start(rid, request.method, path, "", "", peer)
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, "", body)
+        return web.json_response(body, status=400)
+
+    siteurl = (payload.get("siteurl") or "").strip()
+    try:
+        timeout = max(5, min(180, int(payload.get("timeout", 45))))
+    except (TypeError, ValueError):
+        timeout = 45
+
+    _emit_start(rid, request.method, path, siteurl, "", peer)
+
+    try:
+        _validate_siteurl(siteurl)
+    except ValueError as ve:
+        body = {"error": str(ve), "error_code": "bad_request"}
+        _emit_end(rid, time.time() - t0, 400, body)
+        _record_event(path, 400, time.time() - t0, siteurl, body)
+        return web.json_response(body, status=400)
+
+    _stats["in_flight"] += 1
+    try:
+        result = await solve_aws_token_async(siteurl, req_id=rid, timeout=timeout)
+        elapsed = time.time() - t0
+        _stats["challenges"] += 1
+        body = {**result, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, 200, body)
+        _record_event(path, 200, elapsed, siteurl, body)
+        return web.json_response(body)
+    except Exception as exc:
+        elapsed = time.time() - t0
+        _stats["errors"] += 1
+        code, public_msg, status = _classify_error(exc)
+        log.exception("aws-token failed rid=%s code=%s", rid, code)
+        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
+        _emit_end(rid, elapsed, status, body)
+        _record_event(path, status, elapsed, siteurl, body)
+        return web.json_response(body, status=status)
+    finally:
+        _stats["in_flight"] -= 1
+
+
 async def handle_playground(request: web.Request) -> web.Response:
     index_path = os.path.join(TEMPLATE_DIR, "index.html")
     try:
@@ -411,6 +527,8 @@ def main():
     app.router.add_get("/", handle_playground)
     app.router.add_post("/solve", handle_solve)
     app.router.add_post("/solve-challenge", handle_challenge)
+    app.router.add_post("/recaptcha-v3", handle_recaptcha)
+    app.router.add_post("/aws-token", handle_aws_token)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/stats", handle_stats)
     if os.path.isdir(STATIC_DIR):
