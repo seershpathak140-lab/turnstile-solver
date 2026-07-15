@@ -128,7 +128,7 @@ def _validate_siteurl(siteurl: str) -> None:
     Playwright error.
     """
     if not siteurl:
-        raise ValueError("siteurl required")S
+        raise ValueError("siteurl required")
     try:
         u = urlparse(siteurl)
     except Exception:
