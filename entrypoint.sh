@@ -11,4 +11,4 @@ if [ -z "$DISPLAY" ]; then
     sleep 0.5
 fi
 
-exec python3 service.py
+exec python3 -m app

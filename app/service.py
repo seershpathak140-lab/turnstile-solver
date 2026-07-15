@@ -13,16 +13,20 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from solver import get_pool, solve_async, solve_challenge_async, _challenge_proxy
+from .solver import get_pool, solve_async, solve_challenge_async, _challenge_proxy
 
 
 PORT = int(os.environ.get("PORT", 9988))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 8))
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 64 * 1024))  # 64 KB
+# API key gate. Empty -> auth disabled (dev). Set API_KEY to require the
+# X-API-Key header (or ?api_key=) on /solve and /solve-challenge.
+API_KEY = os.environ.get("API_KEY", "").strip()
 
 log = logging.getLogger("service")
 
-WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEB_DIR = os.path.join(_ROOT, "web")
 TEMPLATE_DIR = os.path.join(WEB_DIR, "templates")
 STATIC_DIR = os.path.join(WEB_DIR, "static")
 
@@ -129,6 +133,24 @@ def _validate_siteurl(siteurl: str) -> None:
         raise ValueError("siteurl scheme must be http or https")
     if not u.hostname:
         raise ValueError("siteurl missing host")
+
+
+# Paths reachable without a key even when API_KEY is set. /health stays open
+# for container/uptime probes.
+_PUBLIC_PATHS = frozenset({"/health"})
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """Require the API key on every path except _PUBLIC_PATHS. No-op when
+    API_KEY is unset (dev). Key accepted via X-API-Key header or ?api_key=
+    so the browser playground can pass it in the URL."""
+    if API_KEY and request.path not in _PUBLIC_PATHS:
+        given = request.headers.get("X-API-Key") or request.query.get("api_key") or ""
+        if given != API_KEY:
+            return web.json_response(
+                {"error": "unauthorized", "error_code": "unauthorized"}, status=401)
+    return await handler(request)
 
 
 async def _read_payload(request: web.Request) -> dict:
@@ -272,15 +294,42 @@ async def handle_playground(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html")
 
 
+_warp_cache = {"ts": 0.0, "state": "unknown"}
+
+
+async def _warp_state() -> str:
+    """warp=on/off from Cloudflare's trace endpoint. Cached 30s so health
+    polling doesn't hammer it. 'unknown' if the check itself fails."""
+    import aiohttp
+    if time.time() - _warp_cache["ts"] < 30:
+        return _warp_cache["state"]
+    state = "unknown"
+    try:
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://www.cloudflare.com/cdn-cgi/trace") as r:
+                text = await r.text()
+        for line in text.splitlines():
+            if line.startswith("warp="):
+                state = line.split("=", 1)[1] or "off"
+                break
+    except Exception:
+        state = "unknown"
+    _warp_cache.update(ts=time.time(), state=state)
+    return state
+
+
 async def handle_health(request: web.Request) -> web.Response:
     # Don't force-launch the browser from the healthcheck when a challenge
     # proxy is configured - that caused restart loops previously.
+    warp = await _warp_state()
     proxy_url, proxy_kind = _challenge_proxy()
     if proxy_url:
         return web.json_response({
             "status": "ok",
             "mode": proxy_kind,
             "proxy_url": proxy_url,
+            "warp": warp,
             **_stats,
         })
     pool = await get_pool()
@@ -288,6 +337,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "max_concurrent": pool.max_concurrent,
         "solved_total": pool.solve_count,
+        "warp": warp,
         **_stats,
     })
 
@@ -330,7 +380,7 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
-    import solver as _s
+    from . import solver as _s
     if _s._pool is None:
         return
     await _s._pool.shutdown()
@@ -351,7 +401,10 @@ def main():
                  "camoufox", "playwright", "nodriver", "nodriver.core.browser"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    app = web.Application(client_max_size=MAX_BODY_BYTES)
+    app = web.Application(client_max_size=MAX_BODY_BYTES,
+                          middlewares=[auth_middleware])
+    if API_KEY:
+        print("[solver] API key auth ENABLED", flush=True)
     app.router.add_get("/", handle_playground)
     app.router.add_post("/solve", handle_solve)
     app.router.add_post("/solve-challenge", handle_challenge)

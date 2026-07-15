@@ -1,13 +1,40 @@
 services:
+  # Cloudflare WARP egress. All traffic from solver + byparr exits through
+  # WARP so the upstream IP rotates independently of the host. Because the
+  # other services share this container's network stack, they reach each
+  # other over 127.0.0.1 (not service names) and ports are published here.
+  warp:
+    image: caomingjun/warp:latest
+    container_name: violetics-warp
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    environment:
+      WARP_SLEEP: "2"
+    ports:
+      - "9988:9988"
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "https://www.cloudflare.com/cdn-cgi/trace/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
   solver:
     build: .
     container_name: violetics-solver
     restart: unless-stopped
+    network_mode: "service:warp"
     depends_on:
+      warp:
+        condition: service_healthy
       byparr:
         condition: service_healthy
-    ports:
-      - "9988:9988"
     environment:
       MAX_WORKERS: "8"
       PORT: "9988"
@@ -16,7 +43,8 @@ services:
       # uses a stealthier fingerprint and actively tracks CF changes.
       # Protocol is FlareSolverr-compatible except `max_timeout` is in
       # seconds (not ms) — solver.py handles this.
-      CHALLENGE_PROXY_URL: "http://byparr:8191"
+      # Shared network stack via WARP → byparr is on 127.0.0.1, not a hostname.
+      CHALLENGE_PROXY_URL: "http://127.0.0.1:8191"
       CHALLENGE_PROXY_KIND: "byparr"
     volumes:
       - solver-profile:/tmp/ts_profile
@@ -32,6 +60,10 @@ services:
     image: ghcr.io/thephaseless/byparr:latest
     container_name: violetics-byparr
     restart: unless-stopped
+    network_mode: "service:warp"
+    depends_on:
+      warp:
+        condition: service_healthy
     environment:
       LOG_LEVEL: "WARNING"
       TZ: "Asia/Jakarta"
@@ -45,3 +77,4 @@ services:
 
 volumes:
   solver-profile:
+  warp-data:

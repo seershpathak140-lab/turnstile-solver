@@ -120,7 +120,7 @@ pip install -r requirements.txt
 # Pydoll path only.
 export CHALLENGE_PROXY_URL=http://localhost:8191   # if running Byparr locally
 export CHALLENGE_PROXY_KIND=byparr
-python service.py
+python -m app
 ```
 
 ## Configuration
@@ -133,6 +133,7 @@ Environment variables:
 | `MAX_WORKERS`           | `8`               | Max concurrent in-flight HTTP requests (solves are serialised internally)                         |
 | `MAX_BODY_BYTES`        | `65536`           | Max accepted request body size                                                                    |
 | `LOG_LEVEL`             | `INFO`            | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                                        |
+| `API_KEY`               | _(unset)_         | When set, every path except `/health` requires it via `X-API-Key` header or `?api_key=`. Empty = auth off. |
 | `CHALLENGE_PROXY_URL`   | _(unset)_         | Base URL of a Byparr/FlareSolverr instance. When set, `/solve-challenge` delegates to it.         |
 | `CHALLENGE_PROXY_KIND`  | `byparr`          | `byparr` (timeouts in seconds) or `flaresolverr` (timeouts in ms). Auto-set when only `FLARESOLVERR_URL` is provided. |
 | `FLARESOLVERR_URL`      | _(unset)_         | Back-compat alias for `CHALLENGE_PROXY_URL` with `KIND=flaresolverr`                              |
@@ -327,13 +328,16 @@ clearances.
 ## File layout
 
 ```
-solver.py            Core browser automation (Pydoll) + Byparr delegation
-service.py           aiohttp HTTP wrapper, request logging, validation
-requirements.txt     Python dependencies (pydoll-python, aiohttp)
-Dockerfile           Container image (Python + Chromium + Xvfb)
-docker-compose.yml   Compose stack: solver + byparr
+app/                 Python package (run with `python -m app`)
+  __main__.py        Entry point
+  service.py         aiohttp HTTP wrapper, auth, request logging, validation
+  solver.py          Core browser automation (Camoufox) + Byparr delegation
+requirements.txt     Python dependencies (camoufox, playwright, aiohttp)
+Dockerfile           Container image (Python + Camoufox/Firefox + Xvfb)
+docker-compose.yml   Compose stack: warp + solver + byparr
 entrypoint.sh        Container entrypoint (Xvfb fallback, starts service)
 web/                 Built-in playground UI
+.env.example         Documented environment variables
 ```
 
 ## License

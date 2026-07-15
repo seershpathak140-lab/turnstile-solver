@@ -47,8 +47,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m camoufox fetch
 
-COPY solver.py service.py entrypoint.sh ./
+COPY app ./app
 COPY web ./web
+COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 EXPOSE 9988
