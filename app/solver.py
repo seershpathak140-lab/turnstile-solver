@@ -51,6 +51,12 @@ def _get_profile_dir() -> str:
     return "/tmp/ts_profile"
 
 
+def _solver_proxy() -> Optional[str]:
+    """Outbound proxy for the in-process browser (e.g. WARP HTTP proxy).
+    Empty -> direct connection."""
+    return (os.environ.get("SOLVER_PROXY") or "").strip() or None
+
+
 def _headless_mode():
     """Default to headed under the entrypoint-managed Xvfb. Headless
     Camoufox/Firefox can still be requested via HEADLESS=true but real
@@ -102,11 +108,12 @@ class BrowserSingleton:
                 self.browser = None
             profile = _get_profile_dir()
             os.makedirs(profile, exist_ok=True)
-            log.info("launching camoufox profile=%s headless=%s",
-                     profile, _headless_mode())
+            proxy = _solver_proxy()
+            log.info("launching camoufox profile=%s headless=%s proxy=%s",
+                     profile, _headless_mode(), proxy or "-")
             # exclude_addons=[DefaultAddons.UBO] — uBlock Origin sometimes
             # blocks the CF api.js script, which kills widget mount.
-            self._camoufox = AsyncCamoufox(
+            kwargs = dict(
                 headless=_headless_mode(),
                 humanize=True,
                 persistent_context=True,
@@ -116,6 +123,12 @@ class BrowserSingleton:
                 exclude_addons=[DefaultAddons.UBO],
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
+            if proxy:
+                # geoip=True aligns the spoofed timezone/locale with the
+                # proxy's exit IP, so WARP's geo doesn't contradict the UA.
+                kwargs["proxy"] = {"server": proxy}
+                kwargs["geoip"] = True
+            self._camoufox = AsyncCamoufox(**kwargs)
             self.browser = await self._camoufox.__aenter__()
             self.stopped = False
             log.info("camoufox ready")
@@ -348,6 +361,11 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
         payload_base = {"cmd": "request.get", "max_timeout": max(5, timeout)}
     else:
         payload_base = {"cmd": "request.get", "maxTimeout": max(5000, timeout * 1000)}
+
+    # Route the challenge fetch through the same egress proxy as the browser.
+    proxy = _solver_proxy()
+    if proxy:
+        payload_base["proxy"] = {"url": proxy}
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()

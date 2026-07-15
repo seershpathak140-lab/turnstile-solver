@@ -1,50 +1,49 @@
 services:
-  # Cloudflare WARP egress. All traffic from solver + byparr exits through
-  # WARP so the upstream IP rotates independently of the host. Because the
-  # other services share this container's network stack, they reach each
-  # other over 127.0.0.1 (not service names) and ports are published here.
+  # Cloudflare WARP as an HTTP/SOCKS proxy (not a gateway). solver + byparr
+  # keep their own network and route outbound through warp:8080. Set
+  # WARP_INSTANCES>1 for round-robin IP rotation across multiple WARP daemons.
   warp:
-    image: caomingjun/warp:latest
+    image: dublok/cloudflare-warp:latest
     container_name: violetics-warp
     restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    sysctls:
-      net.ipv6.conf.all.disable_ipv6: "0"
-      net.ipv4.conf.all.src_valid_mark: "1"
     environment:
-      WARP_SLEEP: "2"
-    ports:
-      - "9988:9988"
+      WARP_INSTANCES: "1"
+      WARP_CONNECT_TIMEOUT: "30"
     volumes:
       - warp-data:/var/lib/cloudflare-warp
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "--max-time", "5", "https://www.cloudflare.com/cdn-cgi/trace/"]
-      interval: 30s
+      # healthy == egress actually exits through WARP (warp=on), proven via
+      # the HTTP proxy on :8080, not just that the daemon is up.
+      test:
+        - CMD-SHELL
+        - "curl -fsS --max-time 5 -x http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace/ | grep -q '^warp=on'"
+      interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 20s
+      retries: 8
+      start_period: 60s
 
   solver:
     build: .
     container_name: violetics-solver
     restart: unless-stopped
-    network_mode: "service:warp"
     depends_on:
       warp:
         condition: service_healthy
       byparr:
         condition: service_healthy
+    ports:
+      - "9988:9988"
     environment:
       MAX_WORKERS: "8"
       PORT: "9988"
+      # Camoufox + byparr both egress through the WARP HTTP proxy.
+      SOLVER_PROXY: "http://warp:8080"
       # Byparr (Camoufox + playwright-captcha) replaces FlareSolverr.
       # FS v3.4.6 times out on current CF interactive challenges; Byparr
       # uses a stealthier fingerprint and actively tracks CF changes.
       # Protocol is FlareSolverr-compatible except `max_timeout` is in
       # seconds (not ms) — solver.py handles this.
-      # Shared network stack via WARP → byparr is on 127.0.0.1, not a hostname.
-      CHALLENGE_PROXY_URL: "http://127.0.0.1:8191"
+      CHALLENGE_PROXY_URL: "http://byparr:8191"
       CHALLENGE_PROXY_KIND: "byparr"
     volumes:
       - solver-profile:/tmp/ts_profile
@@ -60,10 +59,6 @@ services:
     image: ghcr.io/thephaseless/byparr:latest
     container_name: violetics-byparr
     restart: unless-stopped
-    network_mode: "service:warp"
-    depends_on:
-      warp:
-        condition: service_healthy
     environment:
       LOG_LEVEL: "WARNING"
       TZ: "Asia/Jakarta"

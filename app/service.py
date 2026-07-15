@@ -298,16 +298,19 @@ _warp_cache = {"ts": 0.0, "state": "unknown"}
 
 
 async def _warp_state() -> str:
-    """warp=on/off from Cloudflare's trace endpoint. Cached 30s so health
-    polling doesn't hammer it. 'unknown' if the check itself fails."""
+    """warp=on/off from Cloudflare's trace endpoint, fetched through the same
+    egress proxy the browser uses so it reflects real solve traffic. Cached
+    30s so health polling doesn't hammer it. 'unknown' if the check fails."""
     import aiohttp
+    from .solver import _solver_proxy
     if time.time() - _warp_cache["ts"] < 30:
         return _warp_cache["state"]
     state = "unknown"
     try:
         timeout = aiohttp.ClientTimeout(total=4)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://www.cloudflare.com/cdn-cgi/trace") as r:
+            async with s.get("https://www.cloudflare.com/cdn-cgi/trace",
+                             proxy=_solver_proxy()) as r:
                 text = await r.text()
         for line in text.splitlines():
             if line.startswith("warp="):
