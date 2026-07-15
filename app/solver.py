@@ -435,87 +435,95 @@ async def solve_challenge_async(siteurl: str, req_id: str = "-",
     async with pool.sem:
         async with pool.solve_lock:
             _step(req_id, f"opening tab -> {siteurl}")
-            page = None
-            try:
-                page = await pool.new_page(siteurl)
-                loop = asyncio.get_event_loop()
-                t0 = loop.time()
-                _step(req_id, "waiting for navigation...")
+            for attempt in (1, 2):
+                page = None
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
-                except Exception:
-                    pass
-                _step(req_id, f"page loaded ({loop.time() - t0:.1f}s)")
-
-                deadline = t0 + timeout
-                cleared = False
-                attempts = 0
-                clicks = 0
-                last_click = 0.0
-
-                while loop.time() < deadline:
-                    is_challenge = await page.evaluate(_IS_CHALLENGE_JS)
-                    if not is_challenge:
-                        cleared = True
-                        break
-                    attempts += 1
-                    if attempts == 1:
-                        _step(req_id, "CF challenge detected, waiting for clear...")
-
-                    now = loop.time()
-                    if clicks < 3 and (clicks == 0 or now - last_click > 6):
-                        rect = await page.evaluate(_CF_WIDGET_RECT_JS)
-                        if rect:
-                            cx = rect["x"] + 28 + random.uniform(-3, 3)
-                            cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
-                            _step(req_id, f"interactive click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
-                            try:
-                                await page.mouse.move(cx - 60, cy - 20)
-                                await asyncio.sleep(0.05)
-                                await page.mouse.move(cx, cy)
-                                await asyncio.sleep(0.03)
-                                await page.mouse.click(cx, cy)
-                            except Exception as e:
-                                _step(req_id, f"click error: {e}")
-                            last_click = now
-                            clicks += 1
-                    await asyncio.sleep(0.3)
-
-                if not cleared:
-                    raise TimeoutError(f"challenge did not clear within {timeout}s")
-
-                final_url = page.url
-                title = await page.title()
-                user_agent = await page.evaluate("navigator.userAgent")
-                html = await page.content()
-                target_host = urlparse(final_url or siteurl).hostname or ""
-                try:
-                    raw_cookies = await pool.browser.cookies()
-                    cookies = [
-                        {"name": c["name"], "value": c["value"], "domain": c["domain"],
-                         "path": c["path"], "expires": c.get("expires", -1)}
-                        for c in raw_cookies
-                        if _match_host(target_host, c.get("domain", ""))
-                    ]
-                except Exception as e:
-                    _step(req_id, f"cookie fetch failed: {e}")
-                    cookies = []
-
-                _step(req_id, f"challenge cleared ({loop.time() - t0:.1f}s, attempts={attempts})")
-                return {
-                    "url": final_url,
-                    "title": title,
-                    "user_agent": user_agent,
-                    "cookies": cookies,
-                    "html": html,
-                }
-            finally:
-                pool.solve_count += 1
-                if page is not None:
+                    page = await pool.new_page(siteurl)
+                    loop = asyncio.get_event_loop()
+                    t0 = loop.time()
+                    _step(req_id, "waiting for navigation...")
                     try:
-                        await page.close()
+                        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
                     except Exception:
                         pass
+                    _step(req_id, f"page loaded ({loop.time() - t0:.1f}s)")
+
+                    deadline = t0 + timeout
+                    cleared = False
+                    attempts = 0
+                    clicks = 0
+                    last_click = 0.0
+
+                    while loop.time() < deadline:
+                        is_challenge = await page.evaluate(_IS_CHALLENGE_JS)
+                        if not is_challenge:
+                            cleared = True
+                            break
+                        attempts += 1
+                        if attempts == 1:
+                            _step(req_id, "CF challenge detected, waiting for clear...")
+
+                        now = loop.time()
+                        if clicks < 3 and (clicks == 0 or now - last_click > 6):
+                            rect = await page.evaluate(_CF_WIDGET_RECT_JS)
+                            if rect:
+                                cx = rect["x"] + 28 + random.uniform(-3, 3)
+                                cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
+                                _step(req_id, f"interactive click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
+                                try:
+                                    await page.mouse.move(cx - 60, cy - 20)
+                                    await asyncio.sleep(0.05)
+                                    await page.mouse.move(cx, cy)
+                                    await asyncio.sleep(0.03)
+                                    await page.mouse.click(cx, cy)
+                                except Exception as e:
+                                    _step(req_id, f"click error: {e}")
+                                last_click = now
+                                clicks += 1
+                        await asyncio.sleep(0.3)
+
+                    if not cleared:
+                        raise TimeoutError(f"challenge did not clear within {timeout}s")
+
+                    final_url = page.url
+                    title = await page.title()
+                    user_agent = await page.evaluate("navigator.userAgent")
+                    html = await page.content()
+                    target_host = urlparse(final_url or siteurl).hostname or ""
+                    try:
+                        raw_cookies = await pool.browser.cookies()
+                        cookies = [
+                            {"name": c["name"], "value": c["value"], "domain": c["domain"],
+                             "path": c["path"], "expires": c.get("expires", -1)}
+                            for c in raw_cookies
+                            if _match_host(target_host, c.get("domain", ""))
+                        ]
+                    except Exception as e:
+                        _step(req_id, f"cookie fetch failed: {e}")
+                        cookies = []
+
+                    _step(req_id, f"challenge cleared ({loop.time() - t0:.1f}s, attempts={attempts})")
+                    return {
+                        "url": final_url,
+                        "title": title,
+                        "user_agent": user_agent,
+                        "cookies": cookies,
+                        "html": html,
+                    }
+                except Exception as exc:
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown()
+                        continue
+                    raise
+                finally:
+                    pool.solve_count += 1
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+            raise RuntimeError("solve_challenge_async: unreachable")
 
 
 def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:
