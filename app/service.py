@@ -57,7 +57,9 @@ def _classify_error(exc: BaseException) -> tuple[str, str, int]:
     msg = str(exc).strip()
     low = msg.lower()
     if isinstance(exc, TimeoutError) or "timeout" in low:
-        return "timeout", msg or "solve timeout", 504
+        # Don't leak Playwright stack text (e.g. "Page.evaluate: ...") — the
+        # full detail still goes to the server log via log.exception.
+        return "timeout", "solve timeout", 504
     if any(h in low for h in ("connection closed", "browser has been closed",
                                "context has been closed", "net::err",
                                "ns_error", "navigation timeout")):
@@ -126,7 +128,7 @@ def _validate_siteurl(siteurl: str) -> None:
     Playwright error.
     """
     if not siteurl:
-        raise ValueError("siteurl required")
+        raise ValueError("siteurl required")S
     try:
         u = urlparse(siteurl)
     except Exception:
