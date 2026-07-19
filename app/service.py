@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from urllib.parse import urlparse
-
+from .leetcode_login import handle_leetcode_login
 from aiohttp import web
 
 from .solver import (get_pool, solve_async, solve_challenge_async,
@@ -533,6 +533,7 @@ def main():
     app.router.add_post("/aws-token", handle_aws_token)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/stats", handle_stats)
+    app.router.add_post("/leetcode-login", handle_leetcode_login)
     if os.path.isdir(STATIC_DIR):
         app.router.add_static("/static/", STATIC_DIR, show_index=False)
     app.on_startup.append(on_startup)
