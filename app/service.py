@@ -10,16 +10,16 @@ import sys
 import time
 import uuid
 from urllib.parse import urlparse
-from .leetcode_login import handle_leetcode_login
+
 from aiohttp import web
 
+from .leetcode_login import handle_leetcode_login
 from .solver import (get_pool, solve_async, solve_challenge_async,
                      solve_recaptcha_v3_async, solve_aws_token_async,
                      _challenge_proxy)
 
-
 PORT = int(os.environ.get("PORT", 9988))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 8))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 1))  # safer default for Render
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 64 * 1024))  # 64 KB
 # API key gate. Empty -> auth disabled (dev). Set API_KEY to require the
 # X-API-Key header (or ?api_key=) on /solve and /solve-challenge.
@@ -33,7 +33,6 @@ TEMPLATE_DIR = os.path.join(WEB_DIR, "templates")
 STATIC_DIR = os.path.join(WEB_DIR, "static")
 
 _PROCESS_STARTED = time.time()
-
 
 _stats = {"in_flight": 0, "solved": 0, "errors": 0, "challenges": 0}
 
@@ -441,23 +440,14 @@ async def _warp_state() -> str:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    # Don't force-launch the browser from the healthcheck when a challenge
-    # proxy is configured - that caused restart loops previously.
+    # IMPORTANT: Do NOT launch the browser here.
+    # On Render free tier this causes the service to never become Live.
     warp = await _warp_state()
     proxy_url, proxy_kind = _challenge_proxy()
-    if proxy_url:
-        return web.json_response({
-            "status": "ok",
-            "mode": proxy_kind,
-            "proxy_url": proxy_url,
-            "warp": warp,
-            **_stats,
-        })
-    pool = await get_pool()
     return web.json_response({
         "status": "ok",
-        "max_concurrent": pool.max_concurrent,
-        "solved_total": pool.solve_count,
+        "mode": proxy_kind or "lazy",
+        "proxy_url": proxy_url,
         "warp": warp,
         **_stats,
     })
@@ -477,7 +467,7 @@ async def handle_stats(request: web.Request) -> web.Response:
     success_rate = round(((_stats["solved"] + _stats["challenges"]) / total) * 100, 1) if total else 0.0
     return web.json_response({
         "uptime": round(time.time() - _PROCESS_STARTED, 1),
-        "mode": proxy_kind or "nodriver",
+        "mode": proxy_kind or "lazy",
         "proxy_url": proxy_url or None,
         **_stats,
         "total_requests": total,
@@ -488,16 +478,9 @@ async def handle_stats(request: web.Request) -> web.Response:
 
 
 async def on_startup(app):
-    proxy_url, proxy_kind = _challenge_proxy()
-    # Always warm the browser at startup — /solve still routes through
-    # Camoufox even when a challenge proxy is configured. Lazy-loading the
-    # browser meant the first /solve paid a ~30s cold-start tax.
-    pool = await get_pool(MAX_WORKERS)
-    if proxy_url:
-        print(f"[solver] {proxy_kind} delegation enabled ({proxy_url}); browser warm, "
-              f"MAX_WORKERS={pool.max_concurrent}", flush=True)
-    else:
-        print(f"[solver] browser warm, MAX_WORKERS={pool.max_concurrent}", flush=True)
+    # CRITICAL for Render: do NOT launch the browser at startup.
+    # Launching Camoufox here causes "No open ports detected" and crashes.
+    print("[solver] lazy mode enabled – browser will start only on first request", flush=True)
 
 
 async def on_cleanup(app):
