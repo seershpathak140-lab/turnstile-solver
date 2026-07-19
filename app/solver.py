@@ -111,6 +111,14 @@ class BrowserSingleton:
             proxy = _solver_proxy()
             log.info("launching camoufox profile=%s headless=%s proxy=%s",
                      profile, _headless_mode(), proxy or "-")
+
+            # Critical for Render / restricted containers
+            os.environ["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
+            os.environ["MOZ_DISABLE_GMP_SANDBOX"] = "1"
+            os.environ["MOZ_DISABLE_RDD_SANDBOX"] = "1"
+            os.environ["MOZ_DISABLE_SOCKET_PROCESS_SANDBOX"] = "1"
+            os.environ["MOZ_DISABLE_NPAPI_SANDBOX"] = "1"
+
             # exclude_addons=[DefaultAddons.UBO] — uBlock Origin sometimes
             # blocks the CF api.js script, which kills widget mount.
             kwargs = dict(
@@ -121,7 +129,23 @@ class BrowserSingleton:
                 os=["windows", "macos", "linux"],
                 locale="en-US",
                 exclude_addons=[DefaultAddons.UBO],
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--hide-scrollbars",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--no-first-run",
+                    "--safebrowsing-disable-auto-update",
+                ],
             )
             if proxy:
                 # geoip=True aligns the spoofed timezone/locale with the
@@ -166,9 +190,9 @@ async def get_pool(size: Optional[int] = None) -> BrowserSingleton:
         _pool_lock = asyncio.Lock()
     async with _pool_lock:
         if _pool is None:
-            n = size if size is not None else int(os.environ.get("MAX_WORKERS", 8))
+            n = size if size is not None else int(os.environ.get("MAX_WORKERS", 1))
             _pool = BrowserSingleton(n)
-            await _pool.ensure()
+            # Do NOT call ensure() here — keep it lazy
         return _pool
 
 
